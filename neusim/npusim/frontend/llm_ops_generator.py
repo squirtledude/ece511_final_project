@@ -1739,8 +1739,215 @@ class GptOssOpsGenerator(LLMOpsGeneratorBase):
             passed to create_sliding_window_attention() vs create_multi_head_attention()
             during decode.
         """
+        
         # TODO: Implement decode ops generation for GPT-oss.
-        raise NotImplementedError("TODO: Implement generate_decode_ops")
+
+        ###Same as DeepSeek:
+
+        ops: list[Operator.Operator] = []
+        fusion_id = fusion_id_start
+        count = self.num_layers * self.output_seqlen
+        d_model_parallel = ceil(self.d_model / self.tensor_parallelism)
+
+        # KVSwap: add ops to swap KV cache
+        if self.config.enable_swap_kv_cache:
+            # compute memory requirements
+            weight_size_bytes = mem_footprint_lib.get_llm_inference_weight_mem_requirement(
+                self.config
+            )
+            kv_cache_size_bytes = mem_footprint_lib.get_llm_inference_kv_cache_mem_requirement(
+                self.config, "prefill"
+            )
+            total_mem_footprint_bytes = self.compute_memory_footprint_bytes("decode")
+
+            chip_mem_capacity_bytes = self.config.hbm_size_GB * 1024 * 1024 * 1024
+            if total_mem_footprint_bytes > chip_mem_capacity_bytes:
+                # swap in/out entire kvcache and weights
+                swap_size_bytes = ceil(
+                    (total_mem_footprint_bytes - chip_mem_capacity_bytes)
+                    / min(self.config.max_swap_kv_cache_times_decode, self.num_layers)  # swap per multiple layers to overlap with compute
+                )
+                ops.append(
+                    ops_lib.create_kvswap_op(
+                        input_shape=[swap_size_bytes],
+                        name=f"PCIeMemSwapIn",
+                        description="PCIeMemSwapIn",
+                        config=self.config,
+                        count=self.output_seqlen,
+                        fusion_id_start=fusion_id,
+                        transfer_type="Input",
+                    )
+                )
+                fusion_id += 1
+                ops.append(
+                    ops_lib.create_kvswap_op(
+                        input_shape=[swap_size_bytes],
+                        name=f"PCIeMemSwapOut",
+                        description="PCIeMemSwapOut",
+                        config=self.config,
+                        count=self.output_seqlen,
+                        fusion_id_start=fusion_id,
+                        transfer_type="Output",
+                    )
+                )
+                fusion_id += 1
+
+        # PP DCN input
+        if self.pipeline_parallelism_dcn > 1:
+            ops.append(
+                ops_lib.create_input_transfer_op(
+                    input_shape=[self.batch_size, self.decode_width, d_model_parallel],
+                    name=f"receiveInput_DCNTTransfer[{self.batch_size * self.decode_width * d_model_parallel}]",
+                    description="DecodeReceiveInputFromPipelineDCN",
+                    config=self.config,
+                    count=self.output_seqlen,
+                    fusion_id_start=fusion_id,
+                )
+            )
+            fusion_id += 1
+
+        # PP ICI input
+        if self.pipeline_parallelism > 1:
+            ops.append(
+                ops_lib.create_input_transfer_op(
+                    input_shape=[self.batch_size, self.decode_width, d_model_parallel],
+                    name=f"receiveInput_ICITransfer[{self.batch_size * self.decode_width * d_model_parallel}]",
+                    description="DecodeReceiveInputFromPipelineICI",
+                    config=self.config,
+                    count=self.output_seqlen,
+                    fusion_id_start=fusion_id,
+                )
+            )
+            fusion_id += 1
+
+        ###layer norm for reference (1)
+        ops.append(
+            ops_lib.create_unary_op(
+                input_shape=[self.batch_size, self.decode_width, d_model_parallel],
+                op_name="RMSNorm",
+                name="X_norm = RMSNorm(X)",
+                description="Attention-serving-decode-Input_rmsnorm",
+                count=count,
+                fusion_id=fusion_id,
+            )
+        )
+        fusion_id += 1
+
+
+#############MHA layers are different#########################
+
+        ##Deepseek implementation here only for refrence
+        # ops += ops_lib.create_multi_head_latent_attention(
+        #     batch_size=self.batch_size,
+        #     config=self.config,
+        #     fusion_id_start=fusion_id,
+        #     is_decode=True,
+        #     description_prefix="Attention-serving-decode-",
+        #     use_flash_attention=self.use_flash_attention,
+        #     tensor_parallelism_axes=self.tensor_parallelism_axes,
+        # )
+        # fusion_id = ops[-1].fusion_id + 1
+
+        ############full attn###############################
+        if self.num_full_layers > 0:
+            ops += ops_lib.create_multi_head_attention(
+                batch_size=self.batch_size,
+                input_seqlen=self.input_seqlen,
+                output_seqlen=self.output_seqlen,
+                decode_width=self.decode_width,
+                num_heads=self.num_heads,
+                d_model=self.d_model,
+                d_head=self.d_head,
+                config=self.config,
+                num_layers=self.num_full_layers,
+                fusion_id_start=fusion_id,
+                is_decode=True,
+                use_flash_attention=self.use_flash_attention,
+                tensor_parallelism_axes=self.tensor_parallelism_axes,
+                ici_bw_GBps=self.tp_ici_bw_GBps,
+                num_kv_heads=self.num_kv_heads,
+                description_prefix="Decode-FullAttention-",
+            )
+
+            fusion_id = ops[-1].fusion_id + 1
+
+        ############slidiing window#########################
+        if self.num_sliding_layers > 0:
+            ops += ops_lib.create_sliding_window_attention(
+                batch_size=self.batch_size,
+                q_seqlen=self.decode_width, ##I think this changes for decode bc 1 at a time not parallel
+                # sliding_window_size=min(self.input_seqlen, self.sliding_window_size),
+                sliding_window_size=self.sliding_window_size, ###I think siding window size already bounds cache size, min not needed?
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                d_model=self.d_model,
+                d_head=self.d_head,
+                num_layers=self.num_sliding_layers, # notice its sliding layers now
+                config=self.config,
+                fusion_id_start=fusion_id,
+                is_decode=True,
+                description_prefix="Decode-SlidingAttention-",
+                use_flash_attention=self.use_flash_attention,
+                tensor_parallelism_axes=self.tensor_parallelism_axes,
+                ici_bw_GBps=self.tp_ici_bw_GBps,
+            )
+
+            fusion_id = ops[-1].fusion_id + 1
+
+        ###########Back to Deepseek##################
+
+        ops += ops_lib.create_ffn(
+            batch_size=self.batch_size,
+            input_seqlen=self.input_seqlen,
+            output_seqlen=self.output_seqlen,
+            decode_width=self.decode_width,
+            d_model=self.d_model,
+            d_ff=self.d_ff,
+            config=self.config,
+            # TODO: currently assuming all layers are MoE layers.
+            # May want to separately model dense layers in DeepSeek models
+            # (aggregated activated moe_inter_dim is similar to the dense layers).
+            num_layers=self.num_layers,
+            ffn_type="deepseek_moe",
+            fusion_id_start=fusion_id,
+            tensor_parallelism_axes=self.expert_tensor_parallelism_axes,
+            expert_parallelism_axes=self.expert_parallelism_axes,
+            is_decode=True,
+        )
+
+        # PP ICI output
+        if self.pipeline_parallelism > 1:
+            ops.append(
+                ops_lib.create_output_transfer_op(
+                    input_shape=[self.batch_size, self.decode_width, d_model_parallel],
+                    name=f"sendOutput_ICITransfer[{self.batch_size * self.decode_width * d_model_parallel}]",
+                    description="DecodeSendOutputToPipelineICI",
+                    config=self.config,
+                    count=self.output_seqlen,
+                    fusion_id_start=fusion_id,
+                )
+            )
+            fusion_id += 1
+
+        # PP DCN output
+        if self.pipeline_parallelism_dcn > 1:
+            ops.append(
+                ops_lib.create_output_transfer_op(
+                    input_shape=[self.batch_size, self.decode_width, d_model_parallel],
+                    name=f"sendOutput_DCNTTransfer[{self.batch_size * self.decode_width * d_model_parallel}]",
+                    description="DecodeSendOutputToPipelineDCN",
+                    config=self.config,
+                    count=self.output_seqlen,
+                    fusion_id_start=fusion_id,
+                )
+            )
+            fusion_id += 1
+
+        return ops
+
+
+
+        #raise NotImplementedError("TODO: Implement generate_decode_ops")
 
     def generate(
         self,
