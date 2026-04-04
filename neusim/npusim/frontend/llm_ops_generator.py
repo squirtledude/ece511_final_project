@@ -2028,4 +2028,119 @@ class GptOssOpsGenerator(LLMOpsGeneratorBase):
             (gate + up + down projections per expert).
         """
         # TODO: Implement memory footprint calculation.
-        raise NotImplementedError("TODO: Implement compute_memory_footprint_bytes")
+
+        if prefill_or_decode == "prefill":
+            # only count input sequence length for prefill
+            seqlen = self.input_seqlen
+        elif prefill_or_decode == "decode":
+            # count both input+output sequence length for decode
+            ###Not sure if this changes to be decode width????
+            seqlen = self.input_seqlen + self.output_seqlen
+        else:
+            raise ValueError(
+                f"Invalid prefill_or_decode value: {prefill_or_decode}. Expected 'prefill' or 'decode'."
+            )
+        
+        
+        ##useful vars
+        tp = (
+            self.config.tensor_parallelism_degree
+            * self.config.tensor_parallel_degree_dcn
+        )
+        ep = (
+            self.config.expert_parallelism_degree
+            * self.config.expert_parallel_degree_dcn
+        )
+        etp = self.config.expert_tensor_parallelism_degree
+        
+
+
+        sliding_window_size = self.sliding_window_size
+        num_full_layers = self.num_full_layers
+        sliding_window_size = self.sliding_window_size
+        num_sliding_layers = self.num_sliding_layers
+        bs = self.batch_size  # This is microbatch size per PP stage in each DP replica
+        num_layers = self.num_layers  # This is num layers per pipeline stage
+        elem_bytes = 2 # Element sizes-all are BFLOAT16-gonna just use one var for clarity
+        total_mem_footprint_bytes = 0
+
+        #######1.  Model Attention Weights
+        num_heads = self.config.num_heads
+        num_kv_heads = getattr(self.config, "num_kv_heads", num_heads)
+        d_model = self.config.d_model
+        d_head = self.config.d_head
+
+        ### # weights per layer
+        q = d_model * num_heads * d_head
+        k = d_model * num_kv_heads * d_head
+        v = d_model * num_kv_heads * d_head
+        o = num_heads * d_head * d_model
+
+        #sum weights, multiply by all layer and size of each weight
+        total_mem_footprint_bytes += ((q + k + v + o) *num_layers * elem_bytes) / tp
+
+
+        ###########2. Kv cache
+
+        # Full attention layers: KV cache spans the full sequence
+        #     For reference, at 128k context with 128-token window:
+        #       - Full attention KV cache per layer: B * 131072 * num_kv_heads * d_head * 2
+        #B = batch size, 131072 = 128 * 1024, 2 = K and V,
+        #thats per lyaer, multiply by all full attn layers, and multiply by size for elem byte
+        total_mem_footprint_bytes += (bs *seqlen *num_kv_heads * d_head * elem_bytes *num_full_layers * 2)/tp
+        ######idt i need to multiply seqlen by 1024 but not sure
+        
+        #  - Sliding attention layers: KV cache is BOUNDED at sliding_window_size
+        #For reference, at 128k context with 128-token window:
+        #       - Sliding window KV cache per layer: B * 128 * num_kv_heads * d_head * 2
+        #128 bc token window sisze
+        #multiply by sliding window layers
+        total_mem_footprint_bytes += (bs * sliding_window_size * num_kv_heads * d_head * elem_bytes * num_sliding_layers * 2) / tp
+        
+        
+        #####ffn stuff
+        ffn_num_params = (
+            self.config.d_model
+            * self.config.moe_d_ff
+            * 3
+            / etp  # each expert has 3 matrices
+            * (self.config.num_shared_experts + self.config.num_routed_experts)
+            / ep  # total # of experts
+            * num_layers
+            )
+            
+        moe_gate_params = (
+            self.config.num_routed_experts * self.config.d_model * num_layers
+        )
+        ffn_weight_bytes = (ffn_num_params + moe_gate_params) * elem_bytes
+        total_mem_footprint_bytes += ffn_weight_bytes
+        # print(f"MoE FFN layer weights: {ffn_weight_bytes} bytes")
+
+        ### MoE FFN activations
+        # Only needs to account for the intermediate matrices in activated experts.
+        # The input and output matrices are already considered in MLA and KV cache.
+        # Specifically, need to allocate spaces for self.w1(x) and self.w3(x).
+        # Then w1(x) can be point-wise multiplied into w3(x) in place, and the result
+        # can be multipled with w2.
+        # We need to reserve space for the worst case token distribution:
+        #   All tokens are routed to the same expert group.
+        ffn_expert_act_bytes = (
+            bs * seqlen * self.config.moe_d_ff * 2 / etp
+        ) * elem_bytes
+        ffn_act_bytes = ffn_expert_act_bytes * num_layers
+        total_mem_footprint_bytes += ffn_act_bytes
+        # print(f"MoE FFN layer activations: {ffn_act_bytes} bytes")
+
+        
+        return round(total_mem_footprint_bytes)
+
+
+
+
+
+
+
+
+
+
+        #raise NotImplementedError("TODO: Implement compute_memory_footprint_bytes")
