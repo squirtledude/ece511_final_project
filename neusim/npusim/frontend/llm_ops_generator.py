@@ -1471,7 +1471,251 @@ class GptOssOpsGenerator(LLMOpsGeneratorBase):
             (num_routed_experts, etc.) are inherited from MoELLMConfig.
         """
         # TODO: Implement prefill ops generation for GPT-oss.
-        raise NotImplementedError("TODO: Implement generate_prefill_ops")
+        # Looking at hints we should just copy deepseeks version and swap out the way attention is given
+        ops: list[Operator.Operator] = []
+        fusion_id = fusion_id_start
+
+        d_model_parallel = ceil(self.d_model / self.tensor_parallelism)
+
+        # KVSwap: add ops to swap KV cache
+        if self.config.enable_swap_kv_cache:
+            # compute memory requirements
+            weight_size_bytes = mem_footprint_lib.get_llm_inference_weight_mem_requirement(
+                self.config
+            )
+            kv_cache_size_bytes = mem_footprint_lib.get_llm_inference_kv_cache_mem_requirement(
+                self.config, "prefill"
+            )
+            total_mem_footprint_bytes = self.compute_memory_footprint_bytes("prefill")
+
+            chip_mem_capacity_bytes = self.config.hbm_size_GB * 1024 * 1024 * 1024
+            if total_mem_footprint_bytes > chip_mem_capacity_bytes:
+                # swap in/out entire kvcache and weights
+                swap_size_bytes = ceil(
+                    (total_mem_footprint_bytes - chip_mem_capacity_bytes)
+                    / min(self.config.max_swap_kv_cache_times_prefill, self.num_layers)  # swap per multiple layers to overlap with compute
+                )
+                ops.append(
+                    ops_lib.create_kvswap_op(
+                        input_shape=[swap_size_bytes],
+                        name=f"PCIeMemSwapIn",
+                        description="PCIeMemSwapIn",
+                        config=self.config,
+                        count=1,
+                        fusion_id_start=fusion_id,
+                        transfer_type="Input",
+                    )
+                )
+                fusion_id += 1
+                ops.append(
+                    ops_lib.create_kvswap_op(
+                        input_shape=[swap_size_bytes],
+                        name=f"PCIeMemSwapOut",
+                        description="PCIeMemSwapOut",
+                        config=self.config,
+                        count=1,
+                        fusion_id_start=fusion_id,
+                        transfer_type="Output",
+                    )
+                )
+                fusion_id += 1
+
+        # PP DCN input
+        if self.pipeline_parallelism_dcn > 1:
+            ops.append(
+                ops_lib.create_input_transfer_op(
+                    input_shape=[self.batch_size, self.input_seqlen, d_model_parallel],
+                    name=f"receiveInput_DCNTTransfer[{self.batch_size * self.input_seqlen * d_model_parallel}]",
+                    description="PrefillReceiveInputFromPipelineDCN",
+                    config=self.config,
+                    count=1,
+                    fusion_id_start=fusion_id,
+                )
+            )
+            fusion_id += 1
+
+        # PP ICI input
+        if self.pipeline_parallelism > 1:
+            ops.append(
+                ops_lib.create_input_transfer_op(
+                    input_shape=[self.batch_size, self.input_seqlen, d_model_parallel],
+                    name=f"receiveInput_ICITransfer[{self.batch_size * self.input_seqlen * d_model_parallel}]",
+                    description="PrefillReceiveInputFromPipelineICI",
+                    config=self.config,
+                    count=1,
+                    fusion_id_start=fusion_id,
+                )
+            )
+            fusion_id += 1
+
+        ops.append(
+            ops_lib.create_unary_op(
+                input_shape=[self.batch_size, self.input_seqlen, d_model_parallel],
+                op_name="RMSNorm",
+                name="X_norm = RMSNorm(X)",
+                description="Fwd-Attention-encoder-Input_rmsnorm",
+                count=self.num_layers,
+                fusion_id=fusion_id,
+            )
+        )
+        fusion_id += 1
+
+        # Full-attention layers, this is where it will differ from deepseek
+        '''
+        For reference, these are arguments for this fn:
+        batch_size: int,
+        input_seqlen: int,
+        output_seqlen: int,
+        decode_width: int,
+        num_heads: int,
+        d_model: int,
+        d_head: int,
+        num_layers: int,
+        config: ModelConfig,
+        dtype: str = "DT_BFLOAT16", # alr set, we can keep it the same based on documentation
+        fusion_id_start: int = 0, # set to running fusion id, look at how deepseek sets it in its create_multi_head_latent_attention call
+        is_decode: bool = False, # keep it false, this is prefill stage 
+        description_prefix: str = "", # set at bottom
+        type: str = "self-attention",
+        q_seqlen: int | None = None, # do we set these? deep seek does not
+        kv_seqlen: int | None = None,
+        d_query: int | None = None,
+        d_key: int | None = None,
+        d_value: int | None = None,
+        use_flash_attention: bool = False,
+        tensor_parallelism_axes: Sequence[int] = [1],
+        ici_bw_GBps: float = 900.0,
+        num_kv_heads: int | None = None,
+
+
+        Additionally this is what LLMOps or whatever sets when it calls create_multi_head_attention:
+        batch_size=self.batch_size,
+        input_seqlen=self.input_seqlen,
+        output_seqlen=self.output_seqlen,
+        decode_width=self.decode_width,
+        num_heads=self.num_heads,
+        d_model=self.d_model,
+        d_head=self.d_head,
+        config=self.config,
+        num_layers=self.num_layers,
+        fusion_id_start=fusion_id,
+        is_decode=False,
+        use_flash_attention=self.use_flash_attention,
+        tensor_parallelism_axes=self.tensor_parallelism_axes,
+        ici_bw_GBps=self.tp_ici_bw_GBps,
+        num_kv_heads=self.num_kv_heads,
+        
+        so they match
+        '''
+        if self.num_full_layers > 0:
+            ops += ops_lib.create_multi_head_attention(
+                batch_size=self.batch_size,
+                input_seqlen=self.input_seqlen,
+                output_seqlen=self.output_seqlen,
+                decode_width=self.decode_width,
+                num_heads=self.num_heads,
+                d_model=self.d_model,
+                d_head=self.d_head,
+                config=self.config,
+                num_layers=self.num_full_layers,
+                fusion_id_start=fusion_id,
+                is_decode=False,
+                use_flash_attention=self.use_flash_attention,
+                tensor_parallelism_axes=self.tensor_parallelism_axes,
+                ici_bw_GBps=self.tp_ici_bw_GBps,
+                num_kv_heads=self.num_kv_heads,
+                description_prefix="Fwd-FullAttention-",
+            )
+            fusion_id = ops[-1].fusion_id + 1
+
+        # Sliding-window-attention layers
+        '''
+        For reference:
+        batch_size: int,
+        q_seqlen: int,
+        sliding_window_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        d_model: int,
+        d_head: int,
+        num_layers: int,
+        config: ModelConfig,
+        dtype: str = "DT_BFLOAT16",
+        fusion_id_start: int = 0,
+        is_decode: bool = False,
+        description_prefix: str = "",
+        use_flash_attention: bool = False,
+        tensor_parallelism_axes: Sequence[int] = [1],
+        ici_bw_GBps: float = 900.0,
+        '''
+        if self.num_sliding_layers > 0:
+            ops += ops_lib.create_sliding_window_attention(
+                batch_size=self.batch_size,
+                q_seqlen=self.input_seqlen,
+                sliding_window_size=min(self.input_seqlen, self.sliding_window_size),
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                d_model=self.d_model,
+                d_head=self.d_head,
+                num_layers=self.num_sliding_layers, # notice its sliding layers now
+                config=self.config,
+                fusion_id_start=fusion_id,
+                is_decode=False,
+                description_prefix="Fwd-SlidingAttention-",
+                use_flash_attention=self.use_flash_attention,
+                tensor_parallelism_axes=self.tensor_parallelism_axes,
+                ici_bw_GBps=self.tp_ici_bw_GBps,
+            )
+            fusion_id = ops[-1].fusion_id + 1
+
+        # now its back to being the same
+        ops += ops_lib.create_ffn(
+            batch_size=self.batch_size,
+            input_seqlen=self.input_seqlen,
+            output_seqlen=self.output_seqlen,
+            decode_width=self.decode_width,
+            d_model=self.d_model,
+            d_ff=self.d_ff,
+            config=self.config,
+            num_layers=self.num_layers,
+            ffn_type="deepseek_moe",
+            fusion_id_start=fusion_id,
+            tensor_parallelism_axes=self.tensor_parallelism_axes,
+            is_decode=False,
+            ici_bw_GBps=self.tp_ici_bw_GBps,
+        )
+        fusion_id = ops[-1].fusion_id + 1
+
+        # PP ICI output
+        if self.pipeline_parallelism > 1:
+            ops.append(
+                ops_lib.create_output_transfer_op(
+                    input_shape=[self.batch_size, self.input_seqlen, d_model_parallel],
+                    name=f"SendOutput_ICITransfer[{self.batch_size * self.input_seqlen * d_model_parallel}]",
+                    description="PrefillSendOutputToPipelineICI",
+                    config=self.config,
+                    count=1,
+                    fusion_id_start=fusion_id,
+                )
+            )
+            fusion_id += 1
+
+        # PP DCN output
+        if self.pipeline_parallelism_dcn > 1:
+            ops.append(
+                ops_lib.create_output_transfer_op(
+                    input_shape=[self.batch_size, self.input_seqlen, d_model_parallel],
+                    name=f"SendOutput_DCNTTransfer[{self.batch_size * self.input_seqlen * d_model_parallel}]",
+                    description="PrefillSendOutputToPipelineDCN",
+                    config=self.config,
+                    count=1,
+                    fusion_id_start=fusion_id,
+                )
+            )
+            fusion_id += 1
+
+        return ops
+        # raise NotImplementedError("TODO: Implement generate_prefill_ops")
 
     def generate_decode_ops(self, fusion_id_start: int = 2) -> list[Operator.Operator]:
         """
