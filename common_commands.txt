@@ -1,0 +1,3 @@
+python run_sim.py --models=gpt-oss-20b --workload=inference --seqlen=8192_128 --num_chips=1 --inference_batch_sizes=1 --versions=5p
+
+i know models, seqlen, workload is right. i think other fields are good

@@ -1910,8 +1910,7 @@ class GptOssOpsGenerator(LLMOpsGeneratorBase):
             num_layers=self.num_layers,
             ffn_type="deepseek_moe",
             fusion_id_start=fusion_id,
-            tensor_parallelism_axes=self.expert_tensor_parallelism_axes,
-            expert_parallelism_axes=self.expert_parallelism_axes,
+            tensor_parallelism_axes=self.tensor_parallelism_axes,
             is_decode=True,
         )
 
