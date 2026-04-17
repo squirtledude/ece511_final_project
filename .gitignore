@@ -2,4 +2,5 @@
 **/.vscode/
 **/.DS_Store
 results/
-**/.coverage
+**/.coverageneusim/run_scripts/*.csv
+neusim/run_scripts/*.csv
