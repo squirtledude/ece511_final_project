@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
 run_pd_disagg.py — PD-disaggregated LLM serving simulation.
-
-Place at: neusim/run_scripts/run_pd_disagg.py
-
-Validation (should match CP3 baseline, excluding KV transfer):
-    python neusim/run_scripts/run_pd_disagg.py \
-        --model configs/models/gpt-oss-20b.json \
-        --prefill_tp 1 --prefill_pp 1 --prefill_batch_size 4 \
-        --decode_tp  1 --decode_pp  1 --decode_batch_size  4 \
-        --total_chips 2 --input_seqlen 2048 --output_seqlen 128
 """
 
 import argparse, copy, json, os
@@ -52,7 +43,7 @@ def build_config(base, tp, pp, batch, outfile, chip_version="5p"):
     return cfg
 
 def compute_kv_cache_transfer_time_ms(config, dcn_bw_GBps):
-    # Force tp=1 since entire KV cache sent over DCM (not sharded)
+    # Force tp=1 since entire KV cache sent over DCN (not sharded)
     tp1_cfg = {**config, "tensor_parallelism_degree": 1, "tensor_parallel_degree_dcn": 1}
     kv_bytes = memory_footprint_analysis_lib.get_llm_inference_kv_cache_mem_requirement(tp1_cfg)
     return kv_bytes / (dcn_bw_GBps * 1e6)

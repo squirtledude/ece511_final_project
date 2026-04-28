@@ -5,10 +5,6 @@ sweep_pd_allocation.py — Sweep chip allocations for PD disaggregated serving.
 Enumerates all valid NP (prefill chip) splits for GPT-OSS-120B on 256 chips,
 runs run_pd_disagg.py for each, adds a co-located baseline row, computes KV
 transfer time at multiple DCN bandwidths, and writes everything to one CSV.
-
-Usage:
-    python neusim/run_scripts/sweep_pd_allocation.py
-    python neusim/run_scripts/sweep_pd_allocation.py --output_dir results/pd_sweep
 """
 
 import argparse
